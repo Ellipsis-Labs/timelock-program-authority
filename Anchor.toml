@@ -1,0 +1,12 @@
+[features]
+seeds = false
+skip-lint = false
+[programs.localnet]
+timelock_program_authority = "timeC3R5LwchSqLTgHdLnFedunV4X8zed65sVZtGxhP"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "localnet"
+wallet = "/Users/x/.config/solana/id.json"
