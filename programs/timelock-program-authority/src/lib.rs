@@ -3,6 +3,9 @@ use anchor_lang::{
     solana_program::{bpf_loader_upgradeable, program::invoke},
 };
 
+const MIN_TIMELOCK_DURATION: u64 = 1440; // ~1 hour at 2.5 slots per second
+const MAX_TIMELOCK_DURATION: u64 = 483840; // ~2 weeks at 2.5 slots per second
+
 #[derive(Clone)]
 pub struct BpfLoaderUpgradeable;
 
@@ -58,9 +61,13 @@ pub mod timelock_program_authority {
             bpf_loader_upgradeable_program,
             ..
         } = ctx.accounts;
+        let timelock_duration = timelock_in_slots
+            .min(MAX_TIMELOCK_DURATION)
+            .max(MIN_TIMELOCK_DURATION);
+        msg!("Timelock duration: {} slots", timelock_duration);
         **timelock = TimelockAuthority {
             authority: program_authority.key(),
-            timelock_in_slots,
+            timelock_in_slots: timelock_duration,
             program_id: program.key(),
             active_deployment: None,
         };
