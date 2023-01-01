@@ -9,6 +9,6 @@ When a deployment is delayed, the verified source code of the upgrade can be tra
 To run the tests:
 
 ```
-cd programs/timelock-program-authority
+cd program
 cargo test-sbf --sbf-out-dir tests/deps
 ```
