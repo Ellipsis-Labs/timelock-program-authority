@@ -442,7 +442,6 @@ pub async fn cancel_modify_timelock_duration(
 pub async fn finalize_modify_timelock_duration(
     ctx: &mut ProgramTestContext,
     program_id: &Pubkey,
-    authority: &Pubkey,
 ) -> Result<(), BanksClientError> {
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let timelock = get_timelock_address(program_id);
@@ -450,7 +449,6 @@ pub async fn finalize_modify_timelock_duration(
         program_id: timelock_program_authority::id(),
         accounts: accounts::FinalizeModifyTimelockDuration {
             payer: ctx.payer.pubkey(),
-            authority: *authority,
             timelock,
             modify_duration_upgrade: get_modify_timelock_duration_upgrade_address(program_id),
         }

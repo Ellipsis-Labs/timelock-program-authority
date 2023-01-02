@@ -8,7 +8,8 @@ pub mod transactions;
 pub mod utils;
 
 use timelock_program_authority::{
-    get_deployment_address, get_immutable_upgrade_address, get_timelock_address, TimelockAuthority,
+    get_deployment_address, get_immutable_upgrade_address,
+    get_modify_timelock_duration_upgrade_address, get_timelock_address, TimelockAuthority,
 };
 pub use transactions::*;
 pub use utils::*;
@@ -28,7 +29,7 @@ async fn test_end_to_end_program_upgrade() {
     let foo_program_id = Keypair::new();
     let program_id = foo_program_id.pubkey();
     let program_data = read_elf(foo_program.to_str().unwrap()).unwrap();
-    let slots = 216_000;
+    let mut slots = 108_000;
 
     // Deploy the original Foo program
     deploy_program(&mut ctx, program_data, &foo_program_id)
@@ -59,11 +60,33 @@ async fn test_end_to_end_program_upgrade() {
     // Test canceling an upgrade
     test_cancel_timelock_upgrade(&mut ctx, &program_id).await;
 
+    // Check that the cancel modify timelock works
+    test_cancel_modify_timelock_duration(&mut ctx, &program_id, slots, slots * 2).await;
+
+    // Check that the cancel modify timelock works
+    test_modify_timelock_duration(&mut ctx, &program_id, slots, slots * 2).await;
+
+    // Test that you can't finalize the upgrade when the duration doesn't pass
+    assert!(
+        test_finalize_immutable_upgrade(&mut ctx, &program_id, slots)
+            .await
+            .is_err(),
+        "Cannot finalize an upgrade that has already been finalized"
+    );
+    let payer = clone_keypair(&ctx.payer);
+    cancel_immutable_upgrade(&mut ctx, &program_id, &payer)
+        .await
+        .unwrap();
+
     // Test canceling an immutable upgrade
     test_cancel_immutable_upgrade(&mut ctx, &program_id).await;
 
+    // Test that you can update when you double the duration now
+    slots *= 2;
     // Test finalizing an immutable upgrade
-    test_finalize_immutable_upgrade(&mut ctx, &program_id, slots).await;
+    test_finalize_immutable_upgrade(&mut ctx, &program_id, slots)
+        .await
+        .unwrap();
 }
 
 // Helper functions
@@ -294,14 +317,12 @@ pub async fn test_finalize_immutable_upgrade(
     ctx: &mut ProgramTestContext,
     program_id: &Pubkey,
     slots: u64,
-) {
+) -> Result<(), BanksClientError> {
     let payer = clone_keypair(&ctx.payer);
     let buffer = Keypair::new();
     let program_data = read_elf(find_file("bar.so").unwrap().to_str().unwrap()).unwrap();
-    write_to_buffer(ctx, &buffer, &program_data).await.unwrap();
-    initialize_immutable_upgrade(ctx, &program_id, &payer)
-        .await
-        .unwrap();
+    write_to_buffer(ctx, &buffer, &program_data).await?;
+    initialize_immutable_upgrade(ctx, &program_id, &payer).await?;
 
     // Validate that you cannot immediately upgrade the program
     assert!(
@@ -313,29 +334,23 @@ pub async fn test_finalize_immutable_upgrade(
 
     let slot = ctx.banks_client.get_root_slot().await.unwrap();
     ctx.warp_to_slot(slot + slots).unwrap();
-    assert!(
-        finalize_immutable_upgrade(ctx, &program_id, &payer.pubkey())
-            .await
-            .is_ok(),
-        "Can permissionlessly finalize immutable upgrade after timelock expires"
-    );
+    finalize_immutable_upgrade(ctx, &program_id, &payer.pubkey()).await?;
 
     assert!(
         ctx.banks_client
             .get_account(get_timelock_address(&program_id))
-            .await
-            .unwrap()
+            .await?
             .is_none(),
         "Timelock is destroyed after upgrade"
     );
     assert!(
         ctx.banks_client
             .get_account(get_immutable_upgrade_address(&program_id))
-            .await
-            .unwrap()
+            .await?
             .is_none(),
         "Immutable deployment address is destroyed after upgrade"
     );
+    Ok(())
 }
 
 pub async fn test_assert_cannot_cancel_or_finalize_non_existent_upgrade(
@@ -380,9 +395,136 @@ pub async fn test_assert_cannot_cancel_or_finalize_non_existent_upgrade(
     );
 
     assert!(
-        finalize_modify_timelock_duration(ctx, &program_id, &buffer.pubkey())
+        finalize_modify_timelock_duration(ctx, &program_id)
             .await
             .is_err(),
         "Cannot finalize a non-existent upgrade"
+    );
+}
+
+async fn test_modify_timelock_duration(
+    ctx: &mut ProgramTestContext,
+    program_id: &Pubkey,
+    slots: u64,
+    duration_in_slots: u64,
+) {
+    let payer = clone_keypair(&ctx.payer);
+    initialize_modify_timelock_duration_upgrade(ctx, &program_id, &payer, duration_in_slots)
+        .await
+        .unwrap();
+
+    // Validate that you cannot immediately upgrade the program
+    assert!(
+        finalize_modify_timelock_duration(ctx, &program_id)
+            .await
+            .is_err(),
+        "Cannot finalize timelock duration upgrade before timelock expires"
+    );
+
+    let slot = ctx.banks_client.get_root_slot().await.unwrap();
+    ctx.warp_to_slot(slot + slots).unwrap();
+    assert!(
+        finalize_modify_timelock_duration(ctx, &program_id)
+            .await
+            .is_ok(),
+        "Can permissionlessly finalize timelock duration upgrade after timelock expires"
+    );
+
+    assert!(
+        ctx.banks_client
+            .get_account(get_modify_timelock_duration_upgrade_address(&program_id))
+            .await
+            .unwrap()
+            .is_none(),
+        "Timelock upgrade is destroyed after upgrade"
+    );
+    assert!(
+        TimelockAuthority::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(get_timelock_address(&program_id))
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice()
+        )
+        .unwrap()
+        .timelock_duration_in_slots
+            == duration_in_slots,
+        "Timelock duration is updated after upgrade"
+    );
+}
+
+async fn test_cancel_modify_timelock_duration(
+    ctx: &mut ProgramTestContext,
+    program_id: &Pubkey,
+    slots: u64,
+    duration_in_slots: u64,
+) {
+    let payer = clone_keypair(&ctx.payer);
+    initialize_modify_timelock_duration_upgrade(ctx, &program_id, &payer, duration_in_slots)
+        .await
+        .unwrap();
+
+    // Validate that you cannot immediately upgrade the program
+    assert!(
+        finalize_modify_timelock_duration(ctx, &program_id)
+            .await
+            .is_err(),
+        "Cannot finalize timelock duration upgrade before timelock expires"
+    );
+
+    let timelock = TimelockAuthority::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(get_timelock_address(&program_id))
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert!(
+        timelock.active_upgrade == Some(get_modify_timelock_duration_upgrade_address(&program_id)),
+        "Upgrade key does not match"
+    );
+
+    let slot = ctx.banks_client.get_root_slot().await.unwrap();
+    ctx.warp_to_slot(slot + slots).unwrap();
+
+    assert!(
+        cancel_modify_timelock_duration(ctx, &program_id, &payer)
+            .await
+            .is_ok(),
+        "Can cancel timelock duration upgrade after timelock expires"
+    );
+    assert!(
+        ctx.banks_client
+            .get_account(get_modify_timelock_duration_upgrade_address(&program_id))
+            .await
+            .unwrap()
+            .is_none(),
+        "Timelock upgrade is destroyed after upgrade"
+    );
+    let timelock = TimelockAuthority::try_deserialize(
+        &mut ctx
+            .banks_client
+            .get_account(get_timelock_address(&program_id))
+            .await
+            .unwrap()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+    assert!(
+        timelock.timelock_duration_in_slots == slots,
+        "Timelock duration is unchanged"
+    );
+    assert!(
+        timelock.active_upgrade == None,
+        "Upgrade key should be None"
     );
 }
