@@ -49,9 +49,9 @@ pub fn initialize_and_assign_timelock_authority(
     msg!("Timelock duration: {} slots", timelock_duration);
     **timelock = TimelockAuthority {
         authority: program_authority.key(),
-        timelock_in_slots: timelock_duration,
+        timelock_duration_in_slots: timelock_duration,
         program_id: program.key(),
-        active_deployment: None,
+        active_upgrade: None,
     };
     // Downstream CPI performs the validation
     invoke(
