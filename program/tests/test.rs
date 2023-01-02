@@ -128,11 +128,11 @@ async fn write_to_buffer(
 
 async fn deploy_program(
     ctx: &mut ProgramTestContext,
-    buffer: &Keypair,
     program_data: Vec<u8>,
     program_id: &Keypair,
 ) -> Result<(), BanksClientError> {
-    write_to_buffer(ctx, buffer, &program_data).await?;
+    let buffer = Keypair::new();
+    write_to_buffer(ctx, &buffer, &program_data).await?;
     let minimum_balance = Rent::default().minimum_balance(program_data.len() * 2);
     let upgrade = &bpf_loader_upgradeable::deploy_with_max_program_len(
         &ctx.payer.pubkey(),
@@ -157,13 +157,13 @@ async fn deploy_program(
 
 async fn initialize_timelock_authority(
     ctx: &mut ProgramTestContext,
-    program_id: &Keypair,
+    program_id: &Pubkey,
     timelock_in_slots: u64,
 ) -> Result<(), BanksClientError> {
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
 
     let timelock = Pubkey::find_program_address(
-        &[b"timelock-authority".as_ref(), program_id.pubkey().as_ref()],
+        &[b"timelock-authority".as_ref(), program_id.as_ref()],
         &timelock_program_authority::id(),
     )
     .0;
@@ -172,9 +172,9 @@ async fn initialize_timelock_authority(
         program_id: timelock_program_authority::id(),
         accounts: accounts::InitializeTimelock {
             timelock,
-            program: program_id.pubkey(),
+            program: *program_id,
             program_data: Pubkey::find_program_address(
-                &[program_id.pubkey().as_ref()],
+                &[program_id.as_ref()],
                 &bpf_loader_upgradeable::id(),
             )
             .0,
@@ -401,21 +401,13 @@ async fn finalize_immutable_upgrade(
         .await
 }
 
-#[tokio::test]
-async fn test_end_to_end_program_upgrade() {
-    let mut ctx = timelock_test().start_with_context().await;
-    let foo_program = find_file("foo.so").unwrap();
-    let foo_program_id = Keypair::new();
-    let program_data = read_elf(foo_program.to_str().unwrap()).unwrap();
-    let buffer = Keypair::new();
-
-    // Deploy the original Foo program
-    deploy_program(&mut ctx, &buffer, program_data, &foo_program_id)
-        .await
-        .unwrap();
-
+async fn test_initialize_timelock_authority_and_attempt_to_change_authority(
+    ctx: &mut ProgramTestContext,
+    program_id: &Pubkey,
+    slots: u64,
+) -> Result<(), BanksClientError> {
     // Initialize the timelock authority on the Foo program
-    initialize_timelock_authority(&mut ctx, &foo_program_id, 216_000) // Around 1 day
+    initialize_timelock_authority(ctx, program_id, slots) // Around 1 day
         .await
         .unwrap();
 
@@ -423,12 +415,11 @@ async fn test_end_to_end_program_upgrade() {
     let blockhash = ctx.banks_client.get_latest_blockhash().await.unwrap();
     let random_key = Pubkey::new_unique();
     let transfer_program_authority = bpf_loader_upgradeable::set_upgrade_authority(
-        &foo_program_id.pubkey(),
+        program_id,
         &ctx.payer.pubkey(),
         Some(&random_key),
     );
-    assert!(ctx
-        .banks_client
+    ctx.banks_client
         .process_transaction(Transaction::new_signed_with_payer(
             &[transfer_program_authority],
             Some(&ctx.payer.pubkey()),
@@ -436,24 +427,25 @@ async fn test_end_to_end_program_upgrade() {
             blockhash,
         ))
         .await
-        .is_err());
+}
 
+async fn test_finalize_timelock_upgrade(
+    ctx: &mut ProgramTestContext,
+    program_id: &Pubkey,
+    slots: u64,
+) -> Result<(), BanksClientError> {
     // Initialize timelock upgrade
     let payer = clone_keypair(&ctx.payer);
     let buffer = Keypair::new();
     let program_data = read_elf(find_file("bar.so").unwrap().to_str().unwrap()).unwrap();
-    write_to_buffer(&mut ctx, &buffer, &program_data)
-        .await
-        .unwrap();
-    initialize_timelock_upgrade(&mut ctx, &foo_program_id.pubkey(), &buffer.pubkey(), &payer)
-        .await
-        .unwrap();
+    write_to_buffer(ctx, &buffer, &program_data).await?;
+    initialize_timelock_upgrade(ctx, &program_id, &buffer.pubkey(), &payer).await?;
 
     assert!(
         TimelockAuthority::try_deserialize(
             &mut ctx
                 .banks_client
-                .get_account(get_timelock_address(&foo_program_id.pubkey()))
+                .get_account(get_timelock_address(&program_id))
                 .await
                 .unwrap()
                 .unwrap()
@@ -463,24 +455,26 @@ async fn test_end_to_end_program_upgrade() {
         .unwrap()
         .active_deployment
             == Some(get_deployment_address(
-                &foo_program_id.pubkey(),
+                &program_id,
                 &buffer.pubkey(),
                 &payer.pubkey()
             )),
-        "Deployment account is removed after upgrade"
+        "Deployment account is set after initialize"
     );
 
     // Validate that you cannot immediately upgrade the program
     assert!(
-        finalize_timelock_upgrade(&mut ctx, &foo_program_id.pubkey(), &buffer.pubkey())
+        finalize_timelock_upgrade(ctx, &program_id, &buffer.pubkey())
             .await
             .is_err(),
         "Cannot finalize upgrade before timelock expires"
     );
 
-    ctx.warp_to_slot(216_001).unwrap();
+    // Warp the slot to the timelock expiration
+    let slot = ctx.banks_client.get_root_slot().await?;
+    ctx.warp_to_slot(slot + slots).unwrap();
     assert!(
-        finalize_timelock_upgrade(&mut ctx, &foo_program_id.pubkey(), &buffer.pubkey())
+        finalize_timelock_upgrade(ctx, &program_id, &buffer.pubkey())
             .await
             .is_ok(),
         "Can permissionlessly finalize upgrade after timelock expires"
@@ -489,7 +483,7 @@ async fn test_end_to_end_program_upgrade() {
     assert!(
         ctx.banks_client
             .get_account(get_deployment_address(
-                &foo_program_id.pubkey(),
+                &program_id,
                 &buffer.pubkey(),
                 &payer.pubkey()
             ))
@@ -503,7 +497,7 @@ async fn test_end_to_end_program_upgrade() {
         TimelockAuthority::try_deserialize(
             &mut ctx
                 .banks_client
-                .get_account(get_timelock_address(&foo_program_id.pubkey()))
+                .get_account(get_timelock_address(&program_id))
                 .await
                 .unwrap()
                 .unwrap()
@@ -515,46 +509,16 @@ async fn test_end_to_end_program_upgrade() {
             == None,
         "Deployment account is removed after upgrade"
     );
+    Ok(())
+}
 
+async fn test_cancel_timelock_upgrade(ctx: &mut ProgramTestContext, program_id: &Pubkey) {
     // Initialize timelock upgrade
     let payer = clone_keypair(&ctx.payer);
     let buffer = Keypair::new();
     let program_data = read_elf(find_file("bar.so").unwrap().to_str().unwrap()).unwrap();
-    write_to_buffer(&mut ctx, &buffer, &program_data)
-        .await
-        .unwrap();
-    initialize_timelock_upgrade(&mut ctx, &foo_program_id.pubkey(), &buffer.pubkey(), &payer)
-        .await
-        .unwrap();
-
-    // Validate that you cannot do any other instructions while upgrade is pending
-    ctx.warp_to_slot(216_002).unwrap();
-    assert!(initialize_timelock_upgrade(
-        &mut ctx,
-        &foo_program_id.pubkey(),
-        &buffer.pubkey(),
-        &payer
-    )
-    .await
-    .is_err());
-    assert!(
-        initialize_immutable_upgrade(&mut ctx, &foo_program_id.pubkey(), &payer)
-            .await
-            .is_err()
-    );
-    assert!(
-        cancel_immutable_upgrade(&mut ctx, &foo_program_id.pubkey(), &payer)
-            .await
-            .is_err()
-    );
-    assert!(
-        finalize_immutable_upgrade(&mut ctx, &foo_program_id.pubkey(), &payer.pubkey())
-            .await
-            .is_err()
-    );
-
-    // Cancel the upgrade
-    cancel_timelock_upgrade(&mut ctx, &foo_program_id.pubkey(), &buffer.pubkey(), &payer)
+    write_to_buffer(ctx, &buffer, &program_data).await.unwrap();
+    initialize_timelock_upgrade(ctx, &program_id, &buffer.pubkey(), &payer)
         .await
         .unwrap();
 
@@ -562,7 +526,54 @@ async fn test_end_to_end_program_upgrade() {
         TimelockAuthority::try_deserialize(
             &mut ctx
                 .banks_client
-                .get_account(get_timelock_address(&foo_program_id.pubkey()))
+                .get_account(get_timelock_address(&program_id))
+                .await
+                .unwrap()
+                .unwrap()
+                .data
+                .as_slice()
+        )
+        .unwrap()
+        .active_deployment
+            == Some(get_deployment_address(
+                &program_id,
+                &buffer.pubkey(),
+                &payer.pubkey()
+            )),
+        "Deployment account is set after initialize"
+    );
+
+    // Warp to a new slot to avoid dups
+    let slot = ctx.banks_client.get_root_slot().await.unwrap();
+    ctx.warp_to_slot(slot + 1).unwrap();
+
+    assert!(
+        initialize_timelock_upgrade(ctx, &program_id, &buffer.pubkey(), &payer)
+            .await
+            .is_err()
+    );
+    assert!(initialize_immutable_upgrade(ctx, &program_id, &payer)
+        .await
+        .is_err());
+    assert!(cancel_immutable_upgrade(ctx, &program_id, &payer)
+        .await
+        .is_err());
+    assert!(
+        finalize_immutable_upgrade(ctx, &program_id, &payer.pubkey())
+            .await
+            .is_err()
+    );
+
+    // Cancel the upgrade
+    cancel_timelock_upgrade(ctx, &program_id, &buffer.pubkey(), &payer)
+        .await
+        .unwrap();
+
+    assert!(
+        TimelockAuthority::try_deserialize(
+            &mut ctx
+                .banks_client
+                .get_account(get_timelock_address(&program_id))
                 .await
                 .unwrap()
                 .unwrap()
@@ -574,69 +585,69 @@ async fn test_end_to_end_program_upgrade() {
             == None,
         "Deployment account is removed after cancel"
     );
+}
 
-    // Initialize timelock upgrade
+async fn test_cancel_immutable_upgrade(ctx: &mut ProgramTestContext, program_id: &Pubkey) {
     let payer = clone_keypair(&ctx.payer);
     let buffer = Keypair::new();
     let program_data = read_elf(find_file("bar.so").unwrap().to_str().unwrap()).unwrap();
-    write_to_buffer(&mut ctx, &buffer, &program_data)
-        .await
-        .unwrap();
-    initialize_immutable_upgrade(&mut ctx, &foo_program_id.pubkey(), &payer)
+    write_to_buffer(ctx, &buffer, &program_data).await.unwrap();
+    initialize_immutable_upgrade(ctx, &program_id, &payer)
         .await
         .unwrap();
 
-    // Validate that you cannot do any other instructions while upgrade is pending
-    ctx.warp_to_slot(216_003).unwrap();
-    assert!(
-        initialize_immutable_upgrade(&mut ctx, &foo_program_id.pubkey(), &payer)
-            .await
-            .is_err()
-    );
-    assert!(initialize_timelock_upgrade(
-        &mut ctx,
-        &foo_program_id.pubkey(),
-        &buffer.pubkey(),
-        &payer
-    )
-    .await
-    .is_err());
-    assert!(
-        cancel_timelock_upgrade(&mut ctx, &foo_program_id.pubkey(), &buffer.pubkey(), &payer)
-            .await
-            .is_err()
-    );
-    assert!(
-        finalize_timelock_upgrade(&mut ctx, &foo_program_id.pubkey(), &buffer.pubkey(),)
-            .await
-            .is_err()
-    );
+    let slot = ctx.banks_client.get_root_slot().await.unwrap();
+    ctx.warp_to_slot(slot + 1).unwrap();
 
+    assert!(initialize_immutable_upgrade(ctx, &program_id, &payer)
+        .await
+        .is_err());
+    assert!(
+        initialize_timelock_upgrade(ctx, &program_id, &buffer.pubkey(), &payer)
+            .await
+            .is_err()
+    );
+    assert!(
+        cancel_timelock_upgrade(ctx, &program_id, &buffer.pubkey(), &payer)
+            .await
+            .is_err()
+    );
+    assert!(
+        finalize_timelock_upgrade(ctx, &program_id, &buffer.pubkey(),)
+            .await
+            .is_err()
+    );
     // Cancel the immutable upgrade
-    cancel_immutable_upgrade(&mut ctx, &foo_program_id.pubkey(), &payer)
+    cancel_immutable_upgrade(ctx, &program_id, &payer)
         .await
         .unwrap();
+}
 
+async fn test_finalize_immutable_upgrade(
+    ctx: &mut ProgramTestContext,
+    program_id: &Pubkey,
+    slots: u64,
+) {
+    let payer = clone_keypair(&ctx.payer);
     let buffer = Keypair::new();
     let program_data = read_elf(find_file("bar.so").unwrap().to_str().unwrap()).unwrap();
-    write_to_buffer(&mut ctx, &buffer, &program_data)
-        .await
-        .unwrap();
-    initialize_immutable_upgrade(&mut ctx, &foo_program_id.pubkey(), &payer)
+    write_to_buffer(ctx, &buffer, &program_data).await.unwrap();
+    initialize_immutable_upgrade(ctx, &program_id, &payer)
         .await
         .unwrap();
 
     // Validate that you cannot immediately upgrade the program
     assert!(
-        finalize_immutable_upgrade(&mut ctx, &foo_program_id.pubkey(), &payer.pubkey())
+        finalize_immutable_upgrade(ctx, &program_id, &payer.pubkey())
             .await
             .is_err(),
         "Cannot finalize immutable upgrade before timelock expires"
     );
 
-    ctx.warp_to_slot(216_003 + 216_000).unwrap();
+    let slot = ctx.banks_client.get_root_slot().await.unwrap();
+    ctx.warp_to_slot(slot + slots).unwrap();
     assert!(
-        finalize_immutable_upgrade(&mut ctx, &foo_program_id.pubkey(), &payer.pubkey())
+        finalize_immutable_upgrade(ctx, &program_id, &payer.pubkey())
             .await
             .is_ok(),
         "Can permissionlessly finalize immutable upgrade after timelock expires"
@@ -644,7 +655,7 @@ async fn test_end_to_end_program_upgrade() {
 
     assert!(
         ctx.banks_client
-            .get_account(get_timelock_address(&foo_program_id.pubkey()))
+            .get_account(get_timelock_address(&program_id))
             .await
             .unwrap()
             .is_none(),
@@ -652,10 +663,52 @@ async fn test_end_to_end_program_upgrade() {
     );
     assert!(
         ctx.banks_client
-            .get_account(get_immutable_deployment_address(&foo_program_id.pubkey()))
+            .get_account(get_immutable_deployment_address(&program_id))
             .await
             .unwrap()
             .is_none(),
         "Immutable deployment address is destroyed after upgrade"
     );
+}
+
+#[tokio::test]
+async fn test_end_to_end_program_upgrade() {
+    let mut ctx = timelock_test().start_with_context().await;
+    let foo_program = find_file("foo.so").unwrap();
+    let foo_program_id = Keypair::new();
+    let program_id = foo_program_id.pubkey();
+    let program_data = read_elf(foo_program.to_str().unwrap()).unwrap();
+    let slots = 216_000;
+
+    // Deploy the original Foo program
+    deploy_program(&mut ctx, program_data, &foo_program_id)
+        .await
+        .unwrap();
+
+    // Upgrade the program authority to the timelock program and verify that the
+    // the authority cannot be changed by the payer
+    assert!(
+        test_initialize_timelock_authority_and_attempt_to_change_authority(
+            &mut ctx,
+            &program_id,
+            slots
+        )
+        .await
+        .is_err(),
+        "Cannot change program authority after it has been delegated to the timelock"
+    );
+
+    // Test finalizing a timelock upgrade
+    test_finalize_timelock_upgrade(&mut ctx, &program_id, slots)
+        .await
+        .unwrap();
+
+    // Test canceling an upgrade
+    test_cancel_timelock_upgrade(&mut ctx, &program_id).await;
+
+    // Test canceling an immutable upgrade
+    test_cancel_immutable_upgrade(&mut ctx, &program_id).await;
+
+    // Test finalizing an immutable upgrade
+    test_finalize_immutable_upgrade(&mut ctx, &program_id, slots).await;
 }
