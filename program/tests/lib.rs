@@ -63,10 +63,10 @@ async fn test_end_to_end_program_upgrade() {
     // Check that the cancel modify timelock works
     test_cancel_modify_timelock_duration(&mut ctx, &program_id, slots, slots * 2).await;
 
-    // Check that the cancel modify timelock works
+    // Check that the finalize modify timelock works
     test_modify_timelock_duration(&mut ctx, &program_id, slots, slots * 2).await;
 
-    // Test that you can't finalize the upgrade when the duration doesn't pass
+    // Test that you can't finalize an upgrade when the duration doesn't pass
     assert!(
         test_finalize_immutable_upgrade(&mut ctx, &program_id, slots)
             .await
