@@ -16,7 +16,7 @@ pub struct InitializeProgramUpgrade<'info> {
         ],
         bump,
         has_one = authority,
-        constraint = timelock.active_deployment == None,
+        constraint = timelock.active_upgrade == None,
     )]
     pub timelock: Account<'info, TimelockAuthority>,
     #[account(
@@ -73,12 +73,12 @@ pub fn initialize_program_upgrade(ctx: Context<InitializeProgramUpgrade>) -> Res
 
     let clock = Clock::get()?;
     **deployment = Deployment {
-        slot: clock.slot,
+        initialization_slot: clock.slot,
         payer: payer.key(),
         buffer: buffer.key(),
     };
     // Then update the timelock authority to reflect the upgrade in progress
-    timelock.active_deployment = Some(deployment.key());
+    timelock.active_upgrade = Some(deployment.key());
     Ok(())
 }
 
@@ -92,7 +92,7 @@ pub struct CancelProgramUpgrade<'info> {
             ],
             bump,
             has_one = authority,
-            constraint = timelock.active_deployment == Some(deployment.key()),
+            constraint = timelock.active_upgrade == Some(deployment.key()),
         )]
     pub timelock: Account<'info, TimelockAuthority>,
     #[account(
@@ -142,7 +142,7 @@ pub fn cancel_program_upgrade(ctx: Context<CancelProgramUpgrade>) -> Result<()> 
         ]],
     )?;
     // Then mark the deployment as inactive
-    timelock.active_deployment = None;
+    timelock.active_upgrade = None;
     Ok(())
 }
 
@@ -155,7 +155,7 @@ pub struct FinalizeProgramUpgrade<'info> {
             timelock.program_id.as_ref(),
         ],
         bump,
-        constraint = timelock.active_deployment == Some(deployment.key()),
+        constraint = timelock.active_upgrade == Some(deployment.key()),
     )]
     pub timelock: Account<'info, TimelockAuthority>,
     #[account(
@@ -203,16 +203,16 @@ pub fn finalize_program_upgrade(ctx: Context<FinalizeProgramUpgrade>) -> Result<
     } = ctx.accounts;
     // Verify that the timelock has expired
     let curr_slot = Clock::get()?.slot;
-    msg!("Timelock start slot: {}", deployment.slot);
+    msg!("Timelock start slot: {}", deployment.initialization_slot);
     msg!("Current slot: {}", curr_slot);
     msg!(
         "Slots until expiration: {}",
         timelock
-            .timelock_in_slots
-            .saturating_sub(curr_slot.saturating_sub(deployment.slot))
+            .timelock_duration_in_slots
+            .saturating_sub(curr_slot.saturating_sub(deployment.initialization_slot))
     );
     require!(
-        curr_slot - deployment.slot >= timelock.timelock_in_slots,
+        curr_slot - deployment.initialization_slot >= timelock.timelock_duration_in_slots,
         TimelockError::TimelockNotExpired
     );
     // Upgrade the program
@@ -239,6 +239,6 @@ pub fn finalize_program_upgrade(ctx: Context<FinalizeProgramUpgrade>) -> Result<
         ]],
     )?;
     // Then mark the deployment as inactive
-    timelock.active_deployment = None;
+    timelock.active_upgrade = None;
     Ok(())
 }

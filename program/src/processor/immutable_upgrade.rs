@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{bpf_loader_upgradeable, program::invoke_signed};
 
-use crate::{BpfLoaderUpgradeable, Deployment, TimelockAuthority, TimelockError};
+use crate::{BpfLoaderUpgradeable, ImmutableUpgrade, TimelockAuthority, TimelockError};
 
 #[derive(Accounts)]
 pub struct InitializeImmutableUpgrade<'info> {
@@ -13,7 +13,7 @@ pub struct InitializeImmutableUpgrade<'info> {
         ],
         bump,
         has_one = authority,
-        constraint = timelock.active_deployment == None,
+        constraint = timelock.active_upgrade == None,
     )]
     pub timelock: Account<'info, TimelockAuthority>,
     #[account(
@@ -21,12 +21,12 @@ pub struct InitializeImmutableUpgrade<'info> {
         payer = payer,
         seeds = [
             b"immutable".as_ref(),
-            timelock.program_id.as_ref(),
+            timelock.key().as_ref(),
         ],
         bump,
-        space = 8 + 8 + 32 + 32
+        space = 8 + 8 + 32
     )]
-    pub deployment: Account<'info, Deployment>,
+    pub immutable_upgrade: Account<'info, ImmutableUpgrade>,
     pub authority: Signer<'info>,
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -37,19 +37,18 @@ pub struct InitializeImmutableUpgrade<'info> {
 pub fn initialize_immutable_upgrade(ctx: Context<InitializeImmutableUpgrade>) -> Result<()> {
     let InitializeImmutableUpgrade {
         timelock,
-        deployment,
+        immutable_upgrade,
         payer,
         ..
     } = ctx.accounts;
     let clock = Clock::get()?;
-    // Create a dummy deployment to start the countdown
-    **deployment = Deployment {
-        slot: clock.slot,
+    // Create an immutable upgrade and start the countdown
+    **immutable_upgrade = ImmutableUpgrade {
+        initialization_slot: clock.slot,
         payer: payer.key(),
-        buffer: anchor_lang::system_program::ID,
     };
     // Then update the timelock authority to reflect the upgrade in progress
-    timelock.active_deployment = Some(deployment.key());
+    timelock.active_upgrade = Some(immutable_upgrade.key());
     Ok(())
 }
 
@@ -63,7 +62,7 @@ pub struct CancelImmutableUpgrade<'info> {
         ],
         bump,
         has_one = authority,
-        constraint = timelock.active_deployment == Some(deployment.key()),
+        constraint = timelock.active_upgrade == Some(immutable_upgrade.key()),
     )]
     pub timelock: Account<'info, TimelockAuthority>,
     #[account(
@@ -71,12 +70,12 @@ pub struct CancelImmutableUpgrade<'info> {
         close = payer,
         seeds = [
             b"immutable".as_ref(),
-            timelock.program_id.as_ref(),
+            timelock.key().as_ref(),
         ],
         bump,
         has_one = payer,
     )]
-    pub deployment: Account<'info, Deployment>,
+    pub immutable_upgrade: Account<'info, ImmutableUpgrade>,
     pub authority: Signer<'info>,
     /// CHECK:
     #[account(mut)]
@@ -87,7 +86,7 @@ pub struct CancelImmutableUpgrade<'info> {
 pub fn cancel_immutable_upgrade(ctx: Context<CancelImmutableUpgrade>) -> Result<()> {
     let CancelImmutableUpgrade { timelock, .. } = ctx.accounts;
     // Then mark the deployment as inactive
-    timelock.active_deployment = None;
+    timelock.active_upgrade = None;
     Ok(())
 }
 
@@ -102,7 +101,7 @@ pub struct FinalizeImmutableUpgrade<'info> {
         ],
         bump,
         has_one = authority,
-        constraint = timelock.active_deployment == Some(deployment.key()),
+        constraint = timelock.active_upgrade == Some(immutable_upgrade.key()),
     )]
     pub timelock: Account<'info, TimelockAuthority>,
     #[account(
@@ -110,12 +109,12 @@ pub struct FinalizeImmutableUpgrade<'info> {
         close = payer,
         seeds = [
             b"immutable".as_ref(),
-            program.key().as_ref(),
+            timelock.key().as_ref(),
         ],
         bump,
         has_one = payer,
     )]
-    pub deployment: Account<'info, Deployment>,
+    pub immutable_upgrade: Account<'info, ImmutableUpgrade>,
     /// CHECK:
     pub program: UncheckedAccount<'info>,
     /// CHECK:
@@ -132,7 +131,7 @@ pub struct FinalizeImmutableUpgrade<'info> {
 pub fn finalize_immutable_upgrade(ctx: Context<FinalizeImmutableUpgrade>) -> Result<()> {
     let FinalizeImmutableUpgrade {
         timelock,
-        deployment,
+        immutable_upgrade,
         program,
         program_data,
         bpf_loader_upgradeable_program,
@@ -140,16 +139,19 @@ pub fn finalize_immutable_upgrade(ctx: Context<FinalizeImmutableUpgrade>) -> Res
     } = ctx.accounts;
     // Verify that the timelock has expired
     let curr_slot = Clock::get()?.slot;
-    msg!("Timelock start slot: {}", deployment.slot);
+    msg!(
+        "Timelock start slot: {}",
+        immutable_upgrade.initialization_slot
+    );
     msg!("Current slot: {}", curr_slot);
     msg!(
         "Slots until expiration: {}",
         timelock
-            .timelock_in_slots
-            .saturating_sub(curr_slot.saturating_sub(deployment.slot))
+            .timelock_duration_in_slots
+            .saturating_sub(curr_slot.saturating_sub(immutable_upgrade.initialization_slot))
     );
     require!(
-        curr_slot - deployment.slot >= timelock.timelock_in_slots,
+        curr_slot - immutable_upgrade.initialization_slot >= timelock.timelock_duration_in_slots,
         TimelockError::TimelockNotExpired
     );
     // Upgrade the program
@@ -167,6 +169,6 @@ pub fn finalize_immutable_upgrade(ctx: Context<FinalizeImmutableUpgrade>) -> Res
         ]],
     )?;
     // Then mark the deployment as inactive
-    timelock.active_deployment = None;
+    timelock.active_upgrade = None;
     Ok(())
 }

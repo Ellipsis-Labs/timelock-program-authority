@@ -44,8 +44,26 @@ pub fn get_deployment_address(program_id: &Pubkey, buffer: &Pubkey, payer: &Pubk
     .0
 }
 
-pub fn get_immutable_deployment_address(program_id: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"immutable".as_ref(), program_id.as_ref()], &crate::id()).0
+pub fn get_immutable_upgrade_address(program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"immutable".as_ref(),
+            get_timelock_address(program_id).as_ref(),
+        ],
+        &crate::id(),
+    )
+    .0
+}
+
+pub fn get_modify_timelock_duration_upgrade_address(program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[
+            b"modify-timelock".as_ref(),
+            get_timelock_address(program_id).as_ref(),
+        ],
+        &crate::id(),
+    )
+    .0
 }
 
 #[program]
@@ -54,9 +72,9 @@ pub mod timelock_program_authority {
     use super::*;
     pub fn initialize_and_assign_timelock_authority(
         ctx: Context<InitializeTimelock>,
-        timelock_in_slots: u64, // WARNING, you will NOT be able to change this after initialization
+        timelock_duration_in_slots: u64, // WARNING, you will NOT be able to change this after initialization
     ) -> Result<()> {
-        initialize::initialize_and_assign_timelock_authority(ctx, timelock_in_slots)
+        initialize::initialize_and_assign_timelock_authority(ctx, timelock_duration_in_slots)
     }
 
     pub fn initialize_program_upgrade(ctx: Context<InitializeProgramUpgrade>) -> Result<()> {
@@ -81,5 +99,27 @@ pub mod timelock_program_authority {
 
     pub fn finalize_immutable_upgrade(ctx: Context<FinalizeImmutableUpgrade>) -> Result<()> {
         immutable_upgrade::finalize_immutable_upgrade(ctx)
+    }
+
+    pub fn initialize_modify_timelock_duration(
+        ctx: Context<InitializeModifyTimelockDuration>,
+        new_timelock_duration_in_slots: u64,
+    ) -> Result<()> {
+        timelock_duration::initialize_modify_timelock_duration_upgrade(
+            ctx,
+            new_timelock_duration_in_slots,
+        )
+    }
+
+    pub fn cancel_modify_timelock_duration(
+        ctx: Context<CancelModifyTimelockDuration>,
+    ) -> Result<()> {
+        timelock_duration::cancel_modify_timelock_duration_upgrade(ctx)
+    }
+
+    pub fn finalize_modify_timelock_duration(
+        ctx: Context<FinalizeModifyTimelockDuration>,
+    ) -> Result<()> {
+        timelock_duration::finalize_modify_timelock_duration_upgrade(ctx)
     }
 }
